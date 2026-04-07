@@ -219,7 +219,12 @@ def create_mailbox(
 ) -> "BaseMailbox":
     """工厂方法：根据 provider 创建对应的 mailbox 实例"""
     extra = extra or {}
-    if provider == "tempmail_lol":
+    if provider == "tmailor":
+        return TMailorMailbox(
+            base_url=extra.get("tmailor_base_url", "https://tmailor.com"),
+            proxy=proxy,
+        )
+    elif provider == "tempmail_lol":
         return TempMailLolMailbox(proxy=proxy)
     elif provider == "skymail":
         return SkyMailMailbox(
@@ -848,6 +853,187 @@ class AitreMailbox(BaseMailbox):
         return self._run_polling_wait(
             timeout=timeout,
             poll_interval=3,
+            poll_once=poll_once,
+        )
+
+
+class TMailorMailbox(BaseMailbox):
+    """TMailor 临时邮箱服务 (tmailor.com)"""
+
+    def __init__(self, base_url: str = None, proxy: str = None):
+        self.base_url = (base_url or "https://tmailor.com").rstrip("/")
+        self.api_url = f"{self.base_url}/api"
+        self.proxy = build_requests_proxy_config(proxy)
+        self._session = None
+
+    def _get_session(self):
+        """获取或创建 requests Session"""
+        if self._session is None:
+            import requests
+
+            self._session = requests.Session()
+            self._session.headers.update(
+                {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.7103.93 Safari/537.36",
+                    "Accept": "application/json, text/plain, */*",
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Content-Type": "application/json",
+                    "Origin": self.base_url,
+                    "Referer": f"{self.base_url}/",
+                }
+            )
+            if self.proxy:
+                self._session.proxies.update(self.proxy)
+        return self._session
+
+    def get_email(self) -> MailboxAccount:
+        """创建新邮箱"""
+        s = self._get_session()
+        # 先访问首页建立会话
+        s.get(f"{self.base_url}/", timeout=20)
+
+        r = s.post(
+            self.api_url,
+            json={
+                "action": "newemail",
+                "fbToken": None,
+                "curentToken": None,
+            },
+            timeout=20,
+        )
+        data = r.json()
+
+        if data.get("msg") != "ok":
+            raise RuntimeError(f"TMailor 创建邮箱失败: {data}")
+
+        email = data.get("email", "")
+        token = data.get("accesstoken", "")
+
+        self._log(f"[TMailor] 生成邮箱: {email}")
+        return MailboxAccount(email=email, account_id=token)
+
+    def get_current_ids(self, account: MailboxAccount) -> set:
+        """获取当前邮件 ID 集合"""
+        try:
+            s = self._get_session()
+            r = s.post(
+                self.api_url,
+                json={
+                    "action": "listinbox",
+                    "accesstoken": account.account_id,
+                    "curentToken": account.account_id,
+                    "fbToken": None,
+                },
+                timeout=20,
+            )
+            data = r.json()
+            if data.get("msg") == "ok" and data.get("data"):
+                return {
+                    str(msg.get("id"))
+                    for msg in data["data"].values()
+                    if msg.get("id")
+                }
+        except Exception:
+            pass
+        return set()
+
+    def _read_mail_detail(self, token: str, message: dict) -> dict:
+        """读取单封邮件详情"""
+        try:
+            s = self._get_session()
+            r = s.post(
+                self.api_url,
+                json={
+                    "action": "read",
+                    "accesstoken": token,
+                    "curentToken": token,
+                    "fbToken": None,
+                    "email_code": message.get("id"),
+                    "email_token": message.get("email_id"),
+                },
+                timeout=20,
+            )
+            data = r.json()
+            return data.get("data") if data.get("msg") == "ok" else {}
+        except Exception:
+            return {}
+
+    def wait_for_code(
+        self,
+        account: MailboxAccount,
+        keyword: str = "",
+        timeout: int = 120,
+        before_ids: set = None,
+        code_pattern: str = None,
+        **kwargs,
+    ) -> str:
+        """轮询等待验证码"""
+        seen = set(before_ids or [])
+        list_id = None
+
+        def poll_once() -> Optional[str]:
+            nonlocal list_id
+
+            try:
+                s = self._get_session()
+                headers = {"listid": list_id} if list_id else {}
+
+                r = s.post(
+                    self.api_url,
+                    json={
+                        "action": "listinbox",
+                        "accesstoken": account.account_id,
+                        "curentToken": account.account_id,
+                        "fbToken": None,
+                    },
+                    headers=headers,
+                    timeout=20,
+                )
+
+                data = r.json()
+                if data.get("msg") != "ok":
+                    return None
+
+                list_id = data.get("code") or list_id
+                messages = data.get("data") or {}
+
+                for msg in messages.values():
+                    mid = str(msg.get("id", ""))
+                    if mid in seen:
+                        continue
+                    seen.add(mid)
+
+                    # 获取邮件详情
+                    detail = self._read_mail_detail(account.account_id, msg) or {}
+
+                    # 合并所有文本内容
+                    text_parts = [
+                        msg.get("subject", ""),
+                        msg.get("text", ""),
+                        msg.get("body", ""),
+                        detail.get("subject", ""),
+                        detail.get("text", ""),
+                        detail.get("body", ""),
+                    ]
+                    text = " ".join(str(x) for x in text_parts if x)
+
+                    # 关键词过滤
+                    if keyword and keyword.lower() not in text.lower():
+                        continue
+
+                    # 提取验证码
+                    code = self._safe_extract(text, code_pattern)
+                    if code:
+                        self._log(f"[TMailor] 收到验证码: {code}")
+                        return code
+
+            except Exception:
+                pass
+            return None
+
+        return self._run_polling_wait(
+            timeout=timeout,
+            poll_interval=5,
             poll_once=poll_once,
         )
 
