@@ -858,105 +858,183 @@ class AitreMailbox(BaseMailbox):
 
 
 class TMailorMailbox(BaseMailbox):
-    """TMailor 临时邮箱服务 (tmailor.com)"""
+    """TMailor 临时邮箱服务 (tmailor.com) - 使用 Playwright 通过 Cloudflare"""
 
     def __init__(self, base_url: str = None, proxy: str = None):
         self.base_url = (base_url or "https://tmailor.com").rstrip("/")
         self.api_url = f"{self.base_url}/api"
-        self.proxy = build_requests_proxy_config(proxy)
-        self._session = None
+        self.proxy = proxy
+        self._browser = None
+        self._context = None
+        self._page = None
+        self._email = None
+        self._token = None
+        self._cookies = None
 
-    def _get_session(self):
-        """获取或创建 requests Session"""
-        if self._session is None:
-            import requests
+    def _init_browser(self):
+        """初始化浏览器，通过 Cloudflare 验证"""
+        if self._page is not None:
+            return
 
-            self._session = requests.Session()
-            self._session.headers.update(
-                {
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.7103.93 Safari/537.36",
-                    "Accept": "application/json, text/plain, */*",
-                    "Accept-Language": "en-US,en;q=0.9",
-                    "Content-Type": "application/json",
-                    "Origin": self.base_url,
-                    "Referer": f"{self.base_url}/",
-                }
-            )
-            if self.proxy:
-                self._session.proxies.update(self.proxy)
-        return self._session
+        from playwright.sync_api import sync_playwright
+
+        self._pw = sync_playwright().start()
+
+        # 构建浏览器启动参数
+        launch_args = {
+            "headless": True,
+            "args": ["--disable-blink-features=AutomationControlled"],
+        }
+
+        # 处理代理
+        if self.proxy:
+            proxy_url = self.proxy
+            if proxy_url.startswith("http://"):
+                server = proxy_url.replace("http://", "")
+                launch_args["proxy"] = {"server": f"http://{server}"}
+            elif proxy_url.startswith("https://"):
+                server = proxy_url.replace("https://", "")
+                launch_args["proxy"] = {"server": f"https://{server}"}
+            elif proxy_url.startswith("socks5://"):
+                launch_args["proxy"] = {"server": proxy_url}
+
+        self._browser = self._pw.chromium.launch(**launch_args)
+        self._context = self._browser.new_context(
+            viewport={"width": 1280, "height": 720},
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.7103.93 Safari/537.36",
+            locale="en-US",
+        )
+        self._page = self._context.new_page()
+
+    def _close_browser(self):
+        """关闭浏览器"""
+        if self._page:
+            self._page.close()
+            self._page = None
+        if self._context:
+            self._context.close()
+            self._context = None
+        if self._browser:
+            self._browser.close()
+            self._browser = None
+        if hasattr(self, "_pw") and self._pw:
+            self._pw.stop()
+            self._pw = None
+
+    def _api_call(self, action: str, extra: dict = None) -> dict:
+        """通过浏览器执行 API 调用"""
+        self._init_browser()
+
+        # 构建请求体
+        body = {"action": action, "fbToken": None, "curentToken": self._token}
+        if extra:
+            body.update(extra)
+
+        # 使用 page.evaluate 在浏览器上下文中执行 fetch
+        script = f"""
+        async () => {{
+            const resp = await fetch('{self.api_url}', {{
+                method: 'POST',
+                headers: {{
+                    'Content-Type': 'application/json',
+                    'Accept': 'application/json',
+                }},
+                body: JSON.stringify({json.dumps(body)}),
+                credentials: 'include',
+            }});
+            return await resp.json();
+        }}
+        """
+
+        result = self._page.evaluate(script)
+        return result or {}
 
     def get_email(self) -> MailboxAccount:
         """创建新邮箱"""
-        s = self._get_session()
-        # 先访问首页建立会话
-        s.get(f"{self.base_url}/", timeout=20)
+        self._init_browser()
 
-        r = s.post(
-            self.api_url,
-            json={
-                "action": "newemail",
-                "fbToken": None,
-                "curentToken": None,
-            },
-            timeout=20,
-        )
-        data = r.json()
+        try:
+            # 先访问首页通过 Cloudflare
+            self._log(f"[TMailor] 访问首页通过 Cloudflare...")
+            self._page.goto(self.base_url, wait_until="networkidle", timeout=30000)
 
-        if data.get("msg") != "ok":
-            raise RuntimeError(f"TMailor 创建邮箱失败: {data}")
+            # 等待 Cloudflare 挑战完成
+            self._page.wait_for_timeout(2000)
 
-        email = data.get("email", "")
-        token = data.get("accesstoken", "")
+            # 检查是否通过
+            if "challenge" in self._page.url or "Just a moment" in self._page.title():
+                self._log("[TMailor] 等待 Cloudflare 挑战...")
+                self._page.wait_for_timeout(5000)
 
-        self._log(f"[TMailor] 生成邮箱: {email}")
-        return MailboxAccount(email=email, account_id=token)
+            # 通过 JavaScript 调用 API 创建邮箱
+            self._log("[TMailor] 创建邮箱...")
+            result = self._page.evaluate(f"""
+            async () => {{
+                const resp = await fetch('{self.api_url}', {{
+                    method: 'POST',
+                    headers: {{
+                        'Content-Type': 'application/json',
+                        'Accept': 'application/json',
+                    }},
+                    body: JSON.stringify({{
+                        action: 'newemail',
+                        fbToken: null,
+                        curentToken: null,
+                    }}),
+                    credentials: 'include',
+                }});
+                return await resp.json();
+            }}
+            """)
+
+            if not result or result.get("msg") != "ok":
+                raise RuntimeError(f"TMailor 创建邮箱失败: {result}")
+
+            self._email = result.get("email", "")
+            self._token = result.get("accesstoken", "")
+
+            self._log(f"[TMailor] 生成邮箱: {self._email}")
+            return MailboxAccount(email=self._email, account_id=self._token)
+
+        except Exception as e:
+            self._close_browser()
+            raise RuntimeError(f"TMailor 创建邮箱失败: {e}")
 
     def get_current_ids(self, account: MailboxAccount) -> set:
         """获取当前邮件 ID 集合"""
+        if not self._page:
+            return set()
+
         try:
-            s = self._get_session()
-            r = s.post(
-                self.api_url,
-                json={
-                    "action": "listinbox",
-                    "accesstoken": account.account_id,
-                    "curentToken": account.account_id,
-                    "fbToken": None,
-                },
-                timeout=20,
-            )
-            data = r.json()
-            if data.get("msg") == "ok" and data.get("data"):
+            result = self._page.evaluate(f"""
+            async () => {{
+                const resp = await fetch('{self.api_url}', {{
+                    method: 'POST',
+                    headers: {{
+                        'Content-Type': 'application/json',
+                        'Accept': 'application/json',
+                    }},
+                    body: JSON.stringify({{
+                        action: 'listinbox',
+                        accesstoken: '{account.account_id}',
+                        curentToken: '{account.account_id}',
+                        fbToken: null,
+                    }}),
+                    credentials: 'include',
+                }});
+                return await resp.json();
+            }}
+            """)
+
+            if result and result.get("msg") == "ok" and result.get("data"):
                 return {
                     str(msg.get("id"))
-                    for msg in data["data"].values()
+                    for msg in result["data"].values()
                     if msg.get("id")
                 }
         except Exception:
             pass
         return set()
-
-    def _read_mail_detail(self, token: str, message: dict) -> dict:
-        """读取单封邮件详情"""
-        try:
-            s = self._get_session()
-            r = s.post(
-                self.api_url,
-                json={
-                    "action": "read",
-                    "accesstoken": token,
-                    "curentToken": token,
-                    "fbToken": None,
-                    "email_code": message.get("id"),
-                    "email_token": message.get("email_id"),
-                },
-                timeout=20,
-            )
-            data = r.json()
-            return data.get("data") if data.get("msg") == "ok" else {}
-        except Exception:
-            return {}
 
     def wait_for_code(
         self,
@@ -975,27 +1053,33 @@ class TMailorMailbox(BaseMailbox):
             nonlocal list_id
 
             try:
-                s = self._get_session()
-                headers = {"listid": list_id} if list_id else {}
+                # 获取邮件列表
+                result = self._page.evaluate(f"""
+                async () => {{
+                    const resp = await fetch('{self.api_url}', {{
+                        method: 'POST',
+                        headers: {{
+                            'Content-Type': 'application/json',
+                            'Accept': 'application/json',
+                            {f"'listid': '{list_id}'," if list_id else ""}
+                        }},
+                        body: JSON.stringify({{
+                            action: 'listinbox',
+                            accesstoken: '{account.account_id}',
+                            curentToken: '{account.account_id}',
+                            fbToken: null,
+                        }}),
+                        credentials: 'include',
+                    }});
+                    return await resp.json();
+                }}
+                """)
 
-                r = s.post(
-                    self.api_url,
-                    json={
-                        "action": "listinbox",
-                        "accesstoken": account.account_id,
-                        "curentToken": account.account_id,
-                        "fbToken": None,
-                    },
-                    headers=headers,
-                    timeout=20,
-                )
-
-                data = r.json()
-                if data.get("msg") != "ok":
+                if not result or result.get("msg") != "ok":
                     return None
 
-                list_id = data.get("code") or list_id
-                messages = data.get("data") or {}
+                list_id = result.get("code") or list_id
+                messages = result.get("data") or {}
 
                 for msg in messages.values():
                     mid = str(msg.get("id", ""))
@@ -1004,7 +1088,27 @@ class TMailorMailbox(BaseMailbox):
                     seen.add(mid)
 
                     # 获取邮件详情
-                    detail = self._read_mail_detail(account.account_id, msg) or {}
+                    detail = self._page.evaluate(f"""
+                    async () => {{
+                        const resp = await fetch('{self.api_url}', {{
+                            method: 'POST',
+                            headers: {{
+                                'Content-Type': 'application/json',
+                                'Accept': 'application/json',
+                            }},
+                            body: JSON.stringify({{
+                                action: 'read',
+                                accesstoken: '{account.account_id}',
+                                curentToken: '{account.account_id}',
+                                fbToken: null,
+                                email_code: '{msg.get("id", "")}',
+                                email_token: '{msg.get("email_id", "")}',
+                            }}),
+                            credentials: 'include',
+                        }});
+                        return await resp.json();
+                    }}
+                    """) or {}
 
                     # 合并所有文本内容
                     text_parts = [
@@ -1031,11 +1135,15 @@ class TMailorMailbox(BaseMailbox):
                 pass
             return None
 
-        return self._run_polling_wait(
-            timeout=timeout,
-            poll_interval=5,
-            poll_once=poll_once,
-        )
+        try:
+            return self._run_polling_wait(
+                timeout=timeout,
+                poll_interval=5,
+                poll_once=poll_once,
+            )
+        finally:
+            # 完成后关闭浏览器释放资源
+            self._close_browser()
 
 
 class TempMailLolMailbox(BaseMailbox):
